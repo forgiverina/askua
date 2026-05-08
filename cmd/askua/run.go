@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"howett.net/plist"
+
 	"github.com/forgiverina/askua/pkg/archive"
 	"github.com/forgiverina/askua/pkg/bundle"
 	"github.com/forgiverina/askua/pkg/cert"
@@ -89,6 +91,11 @@ func run(path string, o runOpts) error {
 
 	if !isZip && !isDir {
 		return runMachO(absPath, o, start)
+	}
+
+	noSign := len(o.provFiles) == 0 && !o.adhoc && o.pkeyFile == "" && o.certFile == ""
+	if noSign && len(o.dylibFiles) == 0 && len(o.rmDylibs) == 0 {
+		return inspectBundle(absPath, isZip, o.tempFolder)
 	}
 
 	tempOutput := false
@@ -268,6 +275,73 @@ func runMachO(path string, o runOpts, start time.Time) error {
 		return err
 	}
 	logger.Successf("- Signed OK! (%v)\n", time.Since(start))
+	return nil
+}
+
+func inspectBundle(absPath string, isZip bool, tempFolder string) error {
+	sigFolder := absPath
+	tmpDir := ""
+	if isZip {
+		tmpDir = filepath.Join(tempFolder, fmt.Sprintf("askua_folder_%d", time.Now().UnixMicro()))
+		if err := archive.Extract(absPath, tmpDir); err != nil {
+			return fmt.Errorf("extract IPA: %w", err)
+		}
+		sigFolder = tmpDir
+		defer os.RemoveAll(tmpDir)
+	}
+
+	appFolder, err := bundle.FindAppFolder(sigFolder)
+	if err != nil {
+		return fmt.Errorf("find .app folder: %w", err)
+	}
+
+	infoPlistPath := filepath.Join(appFolder, "Info.plist")
+	data, err := os.ReadFile(infoPlistPath)
+	if err != nil {
+		return fmt.Errorf("read Info.plist: %w", err)
+	}
+	var info map[string]interface{}
+	if _, err := plist.Unmarshal(data, &info); err != nil {
+		return fmt.Errorf("parse Info.plist: %w", err)
+	}
+
+	get := func(key string) string {
+		if v, ok := info[key].(string); ok {
+			return v
+		}
+		return ""
+	}
+
+	name := get("CFBundleDisplayName")
+	if name == "" {
+		name = get("CFBundleName")
+	}
+	version := get("CFBundleShortVersionString")
+	if version == "" {
+		version = get("CFBundleVersion")
+	}
+
+	exe := get("CFBundleExecutable")
+	signed := false
+	if exe != "" {
+		if m, err := macho.Open(filepath.Join(appFolder, exe)); err == nil {
+			signed = m.CheckSignature()
+			m.Close()
+		}
+	}
+
+	logger.Printf("------------------------------------------------------------------\n")
+	logger.Printf("- Bundle Info:\n")
+	logger.Printf("\tName:       \t%s\n", name)
+	logger.Printf("\tBundleID:   \t%s\n", get("CFBundleIdentifier"))
+	logger.Printf("\tVersion:    \t%s (%s)\n", version, get("CFBundleVersion"))
+	logger.Printf("\tMinOS:      \t%s\n", get("MinimumOSVersion"))
+	logger.Printf("\tExecutable: \t%s\n", exe)
+	logger.Printf("\tSigned:     \t%v\n", signed)
+	if isZip {
+		logger.Printf("\tIPA:        \t%s (%s)\n", filepath.Base(absPath), archive.FormatSize(absPath))
+	}
+	logger.Printf("------------------------------------------------------------------\n")
 	return nil
 }
 
