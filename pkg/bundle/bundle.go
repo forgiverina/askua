@@ -3,10 +3,13 @@ package bundle
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/forgiverina/askua/pkg/cert"
 	"github.com/forgiverina/askua/pkg/logger"
@@ -14,28 +17,37 @@ import (
 )
 
 type Bundle struct {
-	appFolder  string
-	assets     []*cert.Asset
-	force      bool
-	weakInject bool
-	rmProv     bool
+	BundleID      string
+	BundleVersion string
+	DisplayName   string
+	MinVersion    string
 
-	injectDylibs []string
-	rmDylibs     map[string]struct{}
+	InjectDylibs []string
+	RemoveDylibs []string
+	WeakInject   bool
+
+	Force           bool
+	EnableCache     bool
+	RemoveProvision bool
 
 	EnableDocuments          bool
-	MinVersion               string
 	RemoveExtensions         bool
 	RemoveWatchApp           bool
 	RemoveUISupportedDevices bool
+
+	appFolder   string
+	assets      []*cert.Asset
+	force       bool
+	injectPaths []string
+	rmDylibs    map[string]struct{}
 }
 
 type matchResult int
 
 const (
-	matchNone     matchResult = iota
-	matchWildcard             // TEAMID.* or TEAMID.prefix.*
-	matchExact                // TEAMID.bundleID
+	matchNone matchResult = iota
+	matchWildcard
+	matchExact
 )
 
 func (b *Bundle) pickAsset(bundleID string) *cert.Asset {
@@ -80,29 +92,14 @@ func matchAppID(appID, bundleID string) matchResult {
 	return matchNone
 }
 
-func (b *Bundle) SignFolder(
-	assets []*cert.Asset,
-	folder, bundleID, bundleVersion, displayName string,
-	injectDylibs, removeDylibNames []string,
-	force, weakInject, enableCache, removeProvision bool,
-) error {
+func (b *Bundle) SignFolder(assets []*cert.Asset, folder string) error {
 	if len(assets) == 0 {
 		return fmt.Errorf("no signing assets")
 	}
 	b.assets = assets
-	asset := assets[0]
-	b.force = force
-	b.weakInject = weakInject
-	b.rmProv = removeProvision
-	b.injectDylibs = nil
-	b.rmDylibs = make(map[string]struct{})
-	for _, name := range removeDylibNames {
-		if strings.Contains(name, "/") {
-			b.rmDylibs[name] = struct{}{}
-		} else {
-			b.rmDylibs["@executable_path/"+name] = struct{}{}
-		}
-	}
+	b.force = b.Force
+	b.injectPaths = nil
+	b.rmDylibs = macho.DylibSet(b.RemoveDylibs)
 
 	appFolder, err := FindAppFolder(folder)
 	if err != nil {
@@ -112,38 +109,27 @@ func (b *Bundle) SignFolder(
 
 	b.applyModifications()
 
-	if bundleID != "" || displayName != "" || bundleVersion != "" {
+	if b.BundleID != "" || b.DisplayName != "" || b.BundleVersion != "" {
 		b.force = true
-		if err := b.modifyBundleInfo(bundleID, bundleVersion, displayName); err != nil {
+		if err := b.modifyBundleInfo(b.BundleID, b.BundleVersion, b.DisplayName); err != nil {
 			return err
 		}
 	}
 
-	_ = os.Remove(filepath.Join(b.appFolder, "embedded.mobileprovision"))
-	if len(asset.ProvData) > 0 {
-		if err := os.WriteFile(
-			filepath.Join(b.appFolder, "embedded.mobileprovision"),
-			asset.ProvData, 0644,
-		); err != nil {
-			return fmt.Errorf("write embedded.mobileprovision: %w", err)
-		}
-	}
-
-	if len(injectDylibs) > 0 {
+	if len(b.InjectDylibs) > 0 {
 		b.force = true
-		for _, dylib := range injectDylibs {
+		for _, dylib := range b.InjectDylibs {
 			dst := filepath.Join(b.appFolder, filepath.Base(dylib))
 			if err := copyFile(dylib, dst); err != nil {
 				logger.Warnf("- Warning: failed to copy dylib %s: %v\n", dylib, err)
 				continue
 			}
-			b.injectDylibs = append(b.injectDylibs, "@executable_path/"+filepath.Base(dylib))
+			b.injectPaths = append(b.injectPaths, "@executable_path/"+filepath.Base(dylib))
 		}
 	}
 
-	cacheKey := sha1Hex(b.appFolder)
-	cacheFile := filepath.Join(".askua_cache", cacheKey+".json")
-	if _, serr := os.Stat(cacheFile); os.IsNotExist(serr) {
+	cacheFile := filepath.Join(".askua_cache", sha1Hex(b.appFolder)+".json")
+	if _, serr := os.Stat(cacheFile); serr != nil {
 		b.force = true
 	}
 
@@ -168,12 +154,13 @@ func (b *Bundle) SignFolder(
 		}
 	}
 
+	rootAsset := b.pickAsset(root.BundleID)
 	logger.Printf("- Signing: \t%s ...\n", b.appFolder)
 	logger.Printf("- AppName: \t%s\n", root.Name)
 	logger.Printf("- BundleId: \t%s\n", root.BundleID)
 	logger.Printf("- Version: \t%s\n", root.BundleVersion)
-	logger.Printf("- TeamId: \t%s\n", asset.TeamID)
-	logger.Printf("- SubjectCN: \t%s\n", asset.SubjectCN)
+	logger.Printf("- TeamId: \t%s\n", rootAsset.TeamID)
+	logger.Printf("- SubjectCN: \t%s\n", rootAsset.SubjectCN)
 	if b.force {
 		logger.Printf("- ReadCache: \tNO\n")
 	} else {
@@ -184,7 +171,7 @@ func (b *Bundle) SignFolder(
 		return err
 	}
 
-	if enableCache {
+	if b.EnableCache {
 		if err := os.MkdirAll(".askua_cache", 0755); err == nil {
 			if data, err := json.Marshal(root); err == nil {
 				_ = os.WriteFile(cacheFile, data, 0644)
@@ -194,21 +181,48 @@ func (b *Bundle) SignFolder(
 	return nil
 }
 
+func (b *Bundle) signFiles(files []string, asset *cert.Asset) error {
+	if len(files) == 0 {
+		return nil
+	}
+	errs := make([]error, len(files))
+	jobs := make(chan int)
+	workers := min(runtime.GOMAXPROCS(0), len(files))
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				relFile := files[i]
+				logger.Debugf("- SignFile: \t%s\n", relFile)
+				m, err := macho.Open(filepath.Join(b.appFolder, relFile))
+				if err != nil {
+					logger.Warnf("- Warning: skipping non-Mach-O: %s\n", relFile)
+					continue
+				}
+				err = m.Sign(asset, b.force, "", "", "", "")
+				m.Close()
+				if err != nil {
+					errs[i] = fmt.Errorf("sign file %s: %w", relFile, err)
+				}
+			}
+		}()
+	}
+	for i := range files {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
 func (b *Bundle) signNode(node *folderNode) error {
-	primaryAsset := b.assets[0]
 	nodeAsset := b.pickAsset(node.BundleID)
 
-	for _, relFile := range node.Files {
-		absFile := filepath.Join(b.appFolder, relFile)
-		logger.Debugf("- SignFile: \t%s\n", relFile)
-		m, err := macho.Open(absFile)
-		if err != nil {
-			logger.Warnf("- Warning: skipping non-Mach-O: %s\n", relFile)
-			continue
-		}
-		if err := m.Sign(primaryAsset, b.force, "", "", "", ""); err != nil {
-			return fmt.Errorf("sign file %s: %w", relFile, err)
-		}
+	if err := b.signFiles(node.Files, nodeAsset); err != nil {
+		return err
 	}
 
 	for _, sub := range node.Folders {
@@ -219,7 +233,7 @@ func (b *Bundle) signNode(node *folderNode) error {
 
 	basePath := b.appFolder
 	if node.Path != "/" {
-		basePath = filepath.Join(b.appFolder, node.Path)
+		basePath = filepath.Join(b.appFolder, filepath.FromSlash(node.Path))
 	}
 	isRoot := node.Path == "/"
 
@@ -241,13 +255,13 @@ func (b *Bundle) signNode(node *folderNode) error {
 
 	forceSign := b.force
 
-	if isRoot && (len(b.injectDylibs) > 0 || len(b.rmDylibs) > 0) {
+	if isRoot && (len(b.injectPaths) > 0 || len(b.rmDylibs) > 0) {
 		m, err := macho.Open(exePath)
 		if err != nil {
 			return fmt.Errorf("open executable for dylib ops %s: %w", exePath, err)
 		}
-		for _, dylibPath := range b.injectDylibs {
-			if err := m.InjectDylib(b.weakInject, dylibPath); err != nil {
+		for _, dylibPath := range b.injectPaths {
+			if err := m.InjectDylib(b.WeakInject, dylibPath); err != nil {
 				logger.Warnf("- Warning: inject dylib %s: %v\n", dylibPath, err)
 				continue
 			}
@@ -256,12 +270,17 @@ func (b *Bundle) signNode(node *folderNode) error {
 		if len(b.rmDylibs) > 0 {
 			m.RemoveDylibs(b.rmDylibs)
 			for name := range b.rmDylibs {
-				base := strings.TrimPrefix(name, "@executable_path/")
-				_ = os.Remove(filepath.Join(b.appFolder, base))
+				if base, ok := strings.CutPrefix(name, "@executable_path/"); ok {
+					_ = os.Remove(filepath.Join(b.appFolder, filepath.FromSlash(base)))
+				}
 			}
 			forceSign = true
 		}
 		m.Close()
+	}
+
+	if err := b.placeProvision(basePath, isRoot, nodeAsset); err != nil {
+		return err
 	}
 
 	if err := os.MkdirAll(filepath.Join(basePath, "_CodeSignature"), 0755); err != nil {
@@ -270,62 +289,60 @@ func (b *Bundle) signNode(node *folderNode) error {
 	codeResFile := filepath.Join(basePath, "_CodeSignature", "CodeResources")
 
 	var codeResData string
+	existing, readErr := os.ReadFile(codeResFile)
 	switch {
-	case forceSign:
-		cr, err := generateCodeResources(basePath, node.BundleExe, b.rmProv)
+	case forceSign || readErr != nil:
+		codeResData, err = generateCodeResources(basePath, node.BundleExe)
 		if err != nil {
 			return fmt.Errorf("generate CodeResources %s: %w", basePath, err)
 		}
-		codeResData = cr
-
 	case len(node.Changed) > 0:
-		existing, err := os.ReadFile(codeResFile)
+		codeResData, err = updateCodeResources(existing, b.appFolder, node.Path, node.Changed)
 		if err != nil {
-			cr, err := generateCodeResources(basePath, node.BundleExe, b.rmProv)
-			if err != nil {
-				return fmt.Errorf("generate CodeResources %s: %w", basePath, err)
-			}
-			codeResData = cr
-		} else {
-			codeResData, err = updateCodeResources(existing, b.appFolder, node.Path, node.Changed)
-			if err != nil {
-				return fmt.Errorf("update CodeResources %s: %w", basePath, err)
-			}
+			return fmt.Errorf("update CodeResources %s: %w", basePath, err)
 		}
-
 	default:
-		existing, err := os.ReadFile(codeResFile)
-		if err != nil {
-			cr, err := generateCodeResources(basePath, node.BundleExe, b.rmProv)
-			if err != nil {
-				return fmt.Errorf("generate CodeResources %s: %w", basePath, err)
-			}
-			codeResData = cr
-		} else {
-			codeResData = string(existing)
-		}
+		codeResData = string(existing)
 	}
 
 	if err := os.WriteFile(codeResFile, []byte(codeResData), 0644); err != nil {
 		return fmt.Errorf("write CodeResources: %w", err)
 	}
 
-	ext := strings.ToLower(filepath.Ext(basePath))
-	if !isRoot && !b.rmProv && (ext == ".app" || ext == ".appex") {
-		if len(nodeAsset.ProvData) > 0 {
-			_ = os.WriteFile(filepath.Join(basePath, "embedded.mobileprovision"), nodeAsset.ProvData, 0644)
-		}
-	}
-
 	m, err := macho.Open(exePath)
 	if err != nil {
 		return fmt.Errorf("open executable %s: %w", exePath, err)
 	}
+	defer m.Close()
 	if err := m.Sign(
 		nodeAsset, forceSign,
 		node.BundleID, string(infoSHA1), string(infoSHA256), codeResData,
 	); err != nil {
 		return fmt.Errorf("sign executable %s: %w", exePath, err)
+	}
+	return nil
+}
+
+func (b *Bundle) placeProvision(basePath string, isRoot bool, asset *cert.Asset) error {
+	ext := strings.ToLower(filepath.Ext(basePath))
+	if !isRoot && ext != ".app" && ext != ".appex" {
+		return nil
+	}
+	provPath := filepath.Join(basePath, "embedded.mobileprovision")
+	if b.RemoveProvision {
+		if err := os.Remove(provPath); err == nil {
+			logger.Printf("- Removed embedded.mobileprovision\n")
+		}
+		return nil
+	}
+	if len(asset.ProvData) == 0 {
+		if isRoot {
+			_ = os.Remove(provPath)
+		}
+		return nil
+	}
+	if err := os.WriteFile(provPath, asset.ProvData, 0644); err != nil {
+		return fmt.Errorf("write embedded.mobileprovision: %w", err)
 	}
 	return nil
 }
@@ -386,4 +403,12 @@ func (b *Bundle) applyModifications() {
 			logger.Warnf("- Warning: could not remove UISupportedDevices: %v\n", err)
 		}
 	}
+}
+
+func PayloadRoot(appFolder string) (string, error) {
+	payload := filepath.Dir(appFolder)
+	if filepath.Base(payload) != "Payload" {
+		return "", fmt.Errorf("%s is not inside a Payload directory", appFolder)
+	}
+	return filepath.Dir(payload), nil
 }

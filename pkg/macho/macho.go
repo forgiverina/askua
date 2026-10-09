@@ -27,6 +27,7 @@ type MachO struct {
 func Open(path string) (*MachO, error) {
 	m := &MachO{path: path}
 	if err := m.open(path); err != nil {
+		m.close()
 		return nil, err
 	}
 	return m, nil
@@ -159,7 +160,7 @@ func (m *MachO) Sign(asset *cert.Asset, force bool, bundleID, infoSHA1, infoSHA2
 	if m.data == nil || len(m.arches) == 0 {
 		return fmt.Errorf("binary not loaded")
 	}
-	defer m.close() //nolint:errcheck — close() is idempotent; final return propagates sign errors
+	defer m.close() //nolint:errcheck
 
 	if len(m.arches) == 1 {
 		a := m.arches[0]
@@ -262,7 +263,7 @@ func (m *MachO) reallocAndReopen() error {
 	for i, a := range m.arches {
 		tmp := fmt.Sprintf("%s.archo.%d", m.path, i)
 		size, err := a.ReallocCodeSignSpace(tmp)
-		if err != nil || size == 0 {
+		if err != nil {
 			return fmt.Errorf("realloc arch %d: %w", i, err)
 		}
 		results[i] = archResult{size: size, tmpPath: tmp}

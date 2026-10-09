@@ -15,28 +15,28 @@ import (
 )
 
 type SignOptions struct {
-	CertPath string // path to .pem or .cer certificate file (empty for adhoc/p12)
-	KeyPath  string // path to .pem or .p12 private key file
-	ProvPath string // path to .mobileprovision file (empty for ad-hoc)
-	Password string // passphrase for p12 or encrypted key
+	CertPath string
+	KeyPath  string
+	ProvPath string
+	Password string
 
-	BundleID      string // override CFBundleIdentifier (empty = keep original)
-	BundleName    string // override CFBundleDisplayName
-	BundleVersion string // override CFBundleVersion
+	BundleID      string
+	BundleName    string
+	BundleVersion string
 
-	Adhoc       bool   // ad-hoc signature (no cert/prov required)
-	ForceResign bool   // re-sign even if signature is fresh
-	WeakDylib   bool   // inject dylibs as LC_LOAD_WEAK_DYLIB
-	ZipLevel    int    // output IPA compression level 0–9 (0 = store)
-	TempDir     string // working directory for extracted files (defaults to os.TempDir)
+	Adhoc       bool
+	ForceResign bool
+	WeakDylib   bool
+	ZipLevel    int
+	TempDir     string
 
-	OutputPath  string // destination IPA path; if empty the input is signed in place
-	MetadataDir string // if non-empty, extract metadata.json + icon here
+	OutputPath  string
+	MetadataDir string
 
-	EnableDocuments  bool   // set UISupportsDocumentBrowser + UIFileSharingEnabled
-	RemoveExtensions bool   // strip PlugIns/Extensions
-	RemoveWatchApp   bool   // strip embedded Watch app
-	MinVersion       string // override MinimumOSVersion
+	EnableDocuments  bool
+	RemoveExtensions bool
+	RemoveWatchApp   bool
+	MinVersion       string
 }
 
 type SignResult struct {
@@ -127,87 +127,70 @@ func sign(inputPath string, opts *SignOptions) error {
 	}
 
 	sigFolder := absPath
-	tmpFolder := ""
+	force := opts.ForceResign
 	if isZip {
-		tmpFolder = filepath.Join(tmpDir, fmt.Sprintf("askua_folder_%d", time.Now().UnixMicro()))
+		tmpFolder := filepath.Join(tmpDir, fmt.Sprintf("askua_folder_%d", time.Now().UnixMicro()))
+		defer os.RemoveAll(tmpFolder)
 		if err := archive.Extract(absPath, tmpFolder); err != nil {
 			return fmt.Errorf("extract IPA: %w", err)
 		}
 		sigFolder = tmpFolder
-		opts.ForceResign = true
+		force = true
 	}
-	defer func() {
-		if tmpFolder != "" {
-			_ = os.RemoveAll(tmpFolder)
-		}
-	}()
 
 	b := &bundle.Bundle{
-		EnableDocuments:  opts.EnableDocuments,
+		BundleID:         opts.BundleID,
+		BundleVersion:    opts.BundleVersion,
+		DisplayName:      opts.BundleName,
 		MinVersion:       opts.MinVersion,
+		WeakInject:       opts.WeakDylib,
+		Force:            force,
+		EnableCache:      !isZip,
+		EnableDocuments:  opts.EnableDocuments,
 		RemoveExtensions: opts.RemoveExtensions,
 		RemoveWatchApp:   opts.RemoveWatchApp,
 	}
-	if err := b.SignFolder(
-		[]*cert.Asset{a}, sigFolder,
-		opts.BundleID, opts.BundleVersion, opts.BundleName,
-		nil, nil,
-		opts.ForceResign, opts.WeakDylib, !isZip, false,
-	); err != nil {
+	if err := b.SignFolder([]*cert.Asset{a}, sigFolder); err != nil {
 		return fmt.Errorf("sign bundle: %w", err)
 	}
 
+	appFolder, err := bundle.FindAppFolder(sigFolder)
+	if err != nil {
+		return fmt.Errorf("find app folder: %w", err)
+	}
+
 	if opts.OutputPath != "" {
-		appFolder, aerr := bundle.FindAppFolder(sigFolder)
-		if aerr != nil {
-			return fmt.Errorf("find app folder: %w", aerr)
-		}
-		baseFolder := appFolder
-		if idx := lastIndex(appFolder, "Payload"); idx >= 1 {
-			baseFolder = appFolder[:idx-1]
+		baseFolder, err := bundle.PayloadRoot(appFolder)
+		if err != nil {
+			return fmt.Errorf("archive IPA: %w", err)
 		}
 		if err := archive.Archive(baseFolder, opts.OutputPath, opts.ZipLevel); err != nil {
 			return fmt.Errorf("archive IPA: %w", err)
 		}
-
-		if opts.MetadataDir != "" {
-			_ = metadata.Extract(appFolder, opts.MetadataDir, opts.OutputPath)
-		}
-	} else if opts.MetadataDir != "" {
-		if appFolder, aerr := bundle.FindAppFolder(sigFolder); aerr == nil {
-			_ = metadata.Extract(appFolder, opts.MetadataDir, "")
-		}
 	}
-
+	if opts.MetadataDir != "" {
+		_ = metadata.Extract(appFolder, opts.MetadataDir, opts.OutputPath)
+	}
 	return nil
 }
 
 func signMachO(path string, opts *SignOptions) error {
-	m, err := macho.Open(path)
-	if err != nil {
-		return fmt.Errorf("open Mach-O: %w", err)
-	}
-
 	a := &cert.Asset{}
-	prov := opts.ProvPath
 	if err := a.Init(
-		opts.CertPath, opts.KeyPath, prov, "",
+		opts.CertPath, opts.KeyPath, opts.ProvPath, "",
 		opts.Password, opts.Adhoc, false, true,
 	); err != nil {
 		return fmt.Errorf("load signing assets: %w", err)
 	}
 
+	m, err := macho.Open(path)
+	if err != nil {
+		return fmt.Errorf("open Mach-O: %w", err)
+	}
+	defer m.Close()
+
 	if err := m.Sign(a, opts.ForceResign, opts.BundleID, "", "", ""); err != nil {
 		return fmt.Errorf("sign: %w", err)
 	}
 	return nil
-}
-
-func lastIndex(s, substr string) int {
-	for i := len(s) - len(substr); i >= 0; i-- {
-		if s[i:i+len(substr)] == substr {
-			return i
-		}
-	}
-	return -1
 }

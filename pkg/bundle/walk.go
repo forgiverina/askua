@@ -30,7 +30,7 @@ type folderNode struct {
 }
 
 func FindAppFolder(folder string) (string, error) {
-	if strings.HasSuffix(folder, ".app") || strings.HasSuffix(folder, ".appex") {
+	if ext := filepath.Ext(folder); ext == ".app" || ext == ".appex" {
 		return folder, nil
 	}
 
@@ -43,7 +43,7 @@ func FindAppFolder(folder string) (string, error) {
 		if name == "__MACOSX" {
 			return fs.SkipDir
 		}
-		if path != folder && (strings.HasSuffix(path, ".app") || strings.HasSuffix(path, ".appex")) {
+		if ext := filepath.Ext(path); path != folder && (ext == ".app" || ext == ".appex") {
 			found = path
 			return fs.SkipAll
 		}
@@ -90,16 +90,32 @@ func (b *Bundle) getSignFolderInfo(folder string, node *folderNode, getName bool
 	return nil
 }
 
+func (b *Bundle) relPath(path string) string {
+	rel, err := filepath.Rel(b.appFolder, path)
+	if err != nil {
+		return filepath.ToSlash(path)
+	}
+	return filepath.ToSlash(rel)
+}
+
+func isBundleDir(path string) bool {
+	switch filepath.Ext(path) {
+	case ".app", ".appex", ".framework", ".xctest":
+		return true
+	}
+	return false
+}
+
 func (b *Bundle) getObjectsToSign(folder string, root *folderNode) error {
 	var bundles []string
+	var machos []string
 
 	if err := filepath.WalkDir(folder, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if d.IsDir() {
-			if path != folder && (strings.HasSuffix(path, ".app") || strings.HasSuffix(path, ".appex") ||
-				strings.HasSuffix(path, ".framework") || strings.HasSuffix(path, ".xctest")) {
+			if path != folder && isBundleDir(path) {
 				bundles = append(bundles, path)
 			}
 			return nil
@@ -111,26 +127,31 @@ func (b *Bundle) getObjectsToSign(folder string, root *folderNode) error {
 			return nil
 		}
 		if isMachO(path) {
-			root.Files = append(root.Files, strings.TrimPrefix(path, b.appFolder+"/"))
+			machos = append(machos, b.relPath(path))
 		}
 		return nil
 	}); err != nil {
 		return err
 	}
 
-	sort.Slice(bundles, func(i, j int) bool {
-		return strings.Count(bundles[i], "/") > strings.Count(bundles[j], "/")
+	sort.SliceStable(bundles, func(i, j int) bool {
+		return strings.Count(b.relPath(bundles[i]), "/") > strings.Count(b.relPath(bundles[j]), "/")
 	})
 
+	bundleExes := map[string]bool{root.BundleExe: true}
 	for _, bp := range bundles {
-		node := &folderNode{
-			Path: strings.TrimPrefix(bp, b.appFolder+"/"),
-		}
+		node := &folderNode{Path: b.relPath(bp)}
 		if err := b.getSignFolderInfo(bp, node, false); err != nil {
 			logger.Warnf("- Warning: skip bundle %s: %v\n", bp, err)
 			continue
 		}
 		root.Folders = append(root.Folders, node)
+		bundleExes[node.Path+"/"+node.BundleExe] = true
+	}
+	for _, f := range machos {
+		if !bundleExes[f] {
+			root.Files = append(root.Files, f)
+		}
 	}
 	return nil
 }

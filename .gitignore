@@ -1,0 +1,15 @@
+/askua
+/askua.exe
+*.xcframework/
+
+*.p12
+*.pem
+*.key
+*.cer
+*.mobileprovision
+*.ipa
+
+go*.tar.gz
+
+.askua_cache/
+.askua_debug/

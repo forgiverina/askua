@@ -20,10 +20,8 @@ func rootCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "askua [flags] <file|folder>",
 		Short: "askua — iOS code signing for macOS, Linux and Windows",
-		Long: fmt.Sprintf(
-			"askua — codesign alternative for iOS 12+ running on macOS, Linux and Windows.\n" +
-				"See https://github.com/forgiverina/askua for details.",
-		),
+		Long: "askua — codesign alternative for iOS 12+ running on macOS, Linux and Windows.\n" +
+			"See https://github.com/forgiverina/askua for details.",
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		Args:          cobra.ExactArgs(1),

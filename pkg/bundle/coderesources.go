@@ -1,36 +1,39 @@
 package bundle
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 
-	"github.com/forgiverina/askua/pkg/logger"
 	"howett.net/plist"
 )
 
-func generateCodeResources(bundleFolder, bundleExe string, removeProvision bool) (string, error) {
+func generateCodeResources(bundleFolder, bundleExe string) (string, error) {
+	skip := map[string]bool{
+		"_CodeSignature/CodeResources": true,
+		bundleExe:                      true,
+	}
+
 	var allFiles []string
 	err := filepath.WalkDir(bundleFolder, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
-		rel := strings.TrimPrefix(path, bundleFolder+"/")
-		rel = filepath.ToSlash(rel)
-		allFiles = append(allFiles, rel)
+		rel, err := filepath.Rel(bundleFolder, path)
+		if err != nil {
+			return err
+		}
+		if rel = filepath.ToSlash(rel); !skip[rel] {
+			allFiles = append(allFiles, rel)
+		}
 		return nil
 	})
 	if err != nil {
 		return "", err
-	}
-
-	skip := map[string]bool{
-		"_CodeSignature/CodeResources": true,
-		bundleExe:                      true,
 	}
 
 	files := make(map[string]interface{})
@@ -43,15 +46,12 @@ func generateCodeResources(bundleFolder, bundleExe string, removeProvision bool)
 	hashes := make([]hashResult, len(allFiles))
 
 	jobs := make(chan int, len(allFiles))
-	for i, key := range allFiles {
-		if skip[key] || (removeProvision && key == "embedded.mobileprovision") {
-			continue
-		}
+	for i := range allFiles {
 		jobs <- i
 	}
 	close(jobs)
 
-	numWorkers := runtime.GOMAXPROCS(0)
+	numWorkers := min(runtime.GOMAXPROCS(0), max(len(allFiles), 1))
 	var wg sync.WaitGroup
 	wg.Add(numWorkers)
 	for w := 0; w < numWorkers; w++ {
@@ -67,16 +67,6 @@ func generateCodeResources(bundleFolder, bundleExe string, removeProvision bool)
 	wg.Wait()
 
 	for i, key := range allFiles {
-		if skip[key] {
-			continue
-		}
-
-		if removeProvision && key == "embedded.mobileprovision" {
-			_ = os.Remove(filepath.Join(bundleFolder, key))
-			logger.Printf("- Removed embedded.mobileprovision\n")
-			continue
-		}
-
 		if hashes[i].err != nil {
 			return "", fmt.Errorf("hash %s: %w", key, hashes[i].err)
 		}
@@ -84,7 +74,7 @@ func generateCodeResources(bundleFolder, bundleExe string, removeProvision bool)
 
 		isLproj := strings.Contains(key, ".lproj/")
 		isLocVersion := strings.HasSuffix(key, ".lproj/locversion.plist")
-		isDS := strings.HasSuffix(key, ".DS_Store") || key == "Info.plist" || key == "PkgInfo"
+		omitV2 := strings.HasSuffix(key, ".DS_Store") || key == "Info.plist" || key == "PkgInfo"
 
 		if !isLocVersion {
 			if isLproj {
@@ -97,7 +87,7 @@ func generateCodeResources(bundleFolder, bundleExe string, removeProvision bool)
 			}
 		}
 
-		if !isLocVersion && !isDS {
+		if !isLocVersion && !omitV2 {
 			entry := map[string]interface{}{
 				"hash":  h1,
 				"hash2": h256,
@@ -187,17 +177,21 @@ func updateCodeResources(existing []byte, appFolder, nodePath string, changed []
 	files2Map, _ := files2Raw.(map[string]interface{})
 
 	for _, relToApp := range changed {
+		key := filepath.ToSlash(relToApp)
+		if nodePath != "/" {
+			key = strings.TrimPrefix(key, nodePath+"/")
+		}
+
 		absPath := filepath.Join(appFolder, filepath.FromSlash(relToApp))
 		h1, h256, err := fileHashes(absPath)
+		if errors.Is(err, fs.ErrNotExist) {
+			delete(filesMap, key)
+			delete(files2Map, key)
+			continue
+		}
 		if err != nil {
 			return "", fmt.Errorf("hash changed file %s: %w", relToApp, err)
 		}
-
-		key := relToApp
-		if nodePath != "/" {
-			key = strings.TrimPrefix(relToApp, nodePath+"/")
-		}
-		key = filepath.ToSlash(key)
 
 		if filesMap != nil {
 			if existing, ok := filesMap[key]; ok {

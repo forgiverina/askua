@@ -253,6 +253,6 @@ pkg/logger/         Levelled logging
 
 ## Requirements
 
-- Go 1.21+
+- Go 1.24+
 - gomobile (only for iOS framework builds)
 - `ideviceinstaller` (not needed, only for `--install` / `-i`)

@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"howett.net/plist"
@@ -98,14 +97,13 @@ func run(path string, o runOpts) error {
 		return inspectBundle(absPath, isZip, o.tempFolder)
 	}
 
-	tempOutput := false
 	if o.outputFile == "" {
 		if o.install {
-			tempOutput = true
 			o.outputFile = filepath.Join(
 				o.tempFolder,
 				fmt.Sprintf("askua_temp_%d.ipa", time.Now().UnixMicro()),
 			)
+			defer os.Remove(o.outputFile)
 		} else if isZip {
 			return fmt.Errorf("use -o to specify the output IPA file")
 		}
@@ -135,16 +133,13 @@ func run(path string, o runOpts) error {
 	}
 
 	sigFolder := absPath
-	useTempFolder := false
-	enableCache := true
 	if isZip {
 		o.force = true
-		enableCache = false
-		useTempFolder = true
 		sigFolder = filepath.Join(
 			o.tempFolder,
 			fmt.Sprintf("askua_folder_%d", time.Now().UnixMicro()),
 		)
+		defer os.RemoveAll(sigFolder)
 		logger.Printf("- Unzip:\t%s (%s) -> %s ...\n",
 			absPath, archive.FormatSize(absPath), sigFolder)
 		if err := archive.Extract(absPath, sigFolder); err != nil {
@@ -155,44 +150,40 @@ func run(path string, o runOpts) error {
 
 	signStart := time.Now()
 	b := &bundle.Bundle{
-		EnableDocuments:          o.enableDocs,
+		BundleID:                 o.bundleID,
+		BundleVersion:            o.bundleVer,
+		DisplayName:              o.bundleName,
 		MinVersion:               o.minVersion,
+		InjectDylibs:             o.dylibFiles,
+		RemoveDylibs:             o.rmDylibs,
+		WeakInject:               o.weakInject,
+		Force:                    o.force,
+		EnableCache:              !isZip,
+		RemoveProvision:          o.removeProvision,
+		EnableDocuments:          o.enableDocs,
 		RemoveExtensions:         o.removeExts,
 		RemoveWatchApp:           o.removeWatch,
 		RemoveUISupportedDevices: o.removeUISD,
 	}
-
-	err = b.SignFolder(
-		assets, sigFolder,
-		o.bundleID, o.bundleVer, o.bundleName,
-		o.dylibFiles, o.rmDylibs,
-		o.force, o.weakInject, enableCache, o.removeProvision,
-	)
-	elapsed := time.Since(signStart)
-
-	if err != nil {
-		logger.Errorf("- Signed Failed! (%v)\n", elapsed)
-		cleanup(useTempFolder, sigFolder, tempOutput, o.outputFile)
+	if err := b.SignFolder(assets, sigFolder); err != nil {
+		logger.Errorf("- Signed Failed! (%v)\n", time.Since(signStart))
 		return err
 	}
-	logger.Successf("- Signed OK! (%v)\n", elapsed)
+	logger.Successf("- Signed OK! (%v)\n", time.Since(signStart))
+
+	appFolder, err := bundle.FindAppFolder(sigFolder)
+	if err != nil {
+		return err
+	}
 
 	if o.outputFile != "" {
-		appFolder, aerr := bundle.FindAppFolder(sigFolder)
-		if aerr != nil {
-			cleanup(useTempFolder, sigFolder, tempOutput, o.outputFile)
-			return fmt.Errorf("find app folder for archiving: %w", aerr)
+		baseFolder, err := bundle.PayloadRoot(appFolder)
+		if err != nil {
+			return fmt.Errorf("cannot build IPA: %w", err)
 		}
-		payloadIdx := strings.LastIndex(appFolder, "Payload")
-		if payloadIdx < 1 {
-			cleanup(useTempFolder, sigFolder, tempOutput, o.outputFile)
-			return fmt.Errorf("cannot find Payload directory in %s", appFolder)
-		}
-		baseFolder := appFolder[:payloadIdx-1]
 		logger.Printf("- Archiving: \t%s ...\n", o.outputFile)
 		archStart := time.Now()
 		if err := archive.Archive(baseFolder, o.outputFile, o.zipLevel); err != nil {
-			cleanup(useTempFolder, sigFolder, tempOutput, o.outputFile)
 			return fmt.Errorf("archive failed: %w", err)
 		}
 		logger.Successf("- Archive OK! (%v) (%s)\n",
@@ -200,13 +191,10 @@ func run(path string, o runOpts) error {
 	}
 
 	if o.metadataDir != "" {
-		appFolder, aerr := bundle.FindAppFolder(sigFolder)
-		if aerr == nil {
-			if merr := metadata.Extract(appFolder, o.metadataDir, o.outputFile); merr != nil {
-				logger.Warnf("- Warning: metadata extraction failed: %v\n", merr)
-			} else {
-				logger.Printf("- Metadata:\t%s\n", o.metadataDir)
-			}
+		if err := metadata.Extract(appFolder, o.metadataDir, o.outputFile); err != nil {
+			logger.Warnf("- Warning: metadata extraction failed: %v\n", err)
+		} else {
+			logger.Printf("- Metadata:\t%s\n", o.metadataDir)
 		}
 	}
 
@@ -216,11 +204,10 @@ func run(path string, o runOpts) error {
 		icmd.Stdout = os.Stdout
 		icmd.Stderr = os.Stderr
 		if err := icmd.Run(); err != nil {
-			logger.Errorf("- Install failed: %v\n", err)
+			return fmt.Errorf("install failed: %w", err)
 		}
 	}
 
-	cleanup(useTempFolder, sigFolder, tempOutput, o.outputFile)
 	logger.Printf("- Done. (%v)\n", time.Since(start))
 	return nil
 }
@@ -230,11 +217,11 @@ func runMachO(path string, o runOpts, start time.Time) error {
 	if err != nil {
 		return fmt.Errorf("invalid Mach-O file %s: %w", path, err)
 	}
+	defer m.Close()
 
 	if !o.adhoc && len(o.dylibFiles) == 0 && len(o.rmDylibs) == 0 &&
 		(o.pkeyFile == "" || len(o.provFiles) == 0) {
 		m.PrintInfo()
-		m.Close()
 		return nil
 	}
 
@@ -257,19 +244,14 @@ func runMachO(path string, o runOpts, start time.Time) error {
 	}
 
 	if len(o.rmDylibs) > 0 {
-		rmSet := make(map[string]struct{}, len(o.rmDylibs))
-		for _, name := range o.rmDylibs {
-			if strings.Contains(name, "/") {
-				rmSet[name] = struct{}{}
-			} else {
-				rmSet["@executable_path/"+name] = struct{}{}
-			}
-		}
-		m.RemoveDylibs(rmSet)
+		m.RemoveDylibs(macho.DylibSet(o.rmDylibs))
 	}
 
-	logger.Printf("- Signing:\t%s%s\n", path,
-		map[bool]string{true: " (Ad-hoc)", false: ""}[o.adhoc])
+	adhocNote := ""
+	if o.adhoc {
+		adhocNote = " (Ad-hoc)"
+	}
+	logger.Printf("- Signing:\t%s%s\n", path, adhocNote)
 	if err := m.Sign(a, o.force, o.bundleID, "", "", ""); err != nil {
 		logger.Errorf("- Signed Failed! (%v)\n", time.Since(start))
 		return err
@@ -343,13 +325,4 @@ func inspectBundle(absPath string, isZip bool, tempFolder string) error {
 	}
 	logger.Printf("------------------------------------------------------------------\n")
 	return nil
-}
-
-func cleanup(rmFolder bool, folder string, rmOutput bool, output string) {
-	if rmFolder {
-		_ = os.RemoveAll(folder)
-	}
-	if rmOutput {
-		_ = os.Remove(output)
-	}
 }

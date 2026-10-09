@@ -12,10 +12,7 @@ import (
 	"github.com/forgiverina/askua/pkg/cert"
 	"github.com/forgiverina/askua/pkg/codesign"
 	"github.com/forgiverina/askua/pkg/logger"
-	"go.mozilla.org/pkcs7"
 )
-
-var execSegLimit uint64
 
 type ArchO struct {
 	data []byte
@@ -33,6 +30,7 @@ type ArchO struct {
 	codeSignCmdOffset int
 	linkeditOffset    int
 	freeSpaceInCmds   uint32
+	execSegLimit      uint64
 
 	fileType   uint32
 	headerSize uint32
@@ -63,14 +61,25 @@ func (a *ArchO) Init(data []byte) error {
 	} else {
 		a.headerSize = 28 // sizeof(mach_header)
 	}
+	if len(data) < int(a.headerSize) {
+		return fmt.Errorf("mach header truncated")
+	}
 
 	a.fileType = a.bo32(a.readU32(12))
 	ncmds := a.bo32(a.readU32(16))
 
-	// default code length is total size aligned to 16
 	a.codeLength = uint32(len(data))
 	if a.codeLength%16 != 0 {
 		a.codeLength = a.codeLength + 16 - (a.codeLength % 16)
+	}
+
+	sizeofCmds := a.bo32(a.readU32At(20))
+	cmdsEnd := a.headerSize + sizeofCmds
+	firstSectOff := uint32(0)
+	noteSection := func(fileOff uint32) {
+		if fileOff >= cmdsEnd && (firstSectOff == 0 || fileOff < firstSectOff) {
+			firstSectOff = fileOff
+		}
 	}
 
 	off := int(a.headerSize)
@@ -80,37 +89,32 @@ func (a *ArchO) Init(data []byte) error {
 		}
 		cmd := a.bo32(a.readU32At(off))
 		cmdSize := a.bo32(a.readU32At(off + 4))
+		if cmdSize < 8 {
+			return fmt.Errorf("invalid load command size %d at offset %d", cmdSize, off)
+		}
 
 		switch cmd {
 		case LCSegment:
 			if off+56 <= len(data) {
 				segName := nullString(data[off+8 : off+24])
+				nsects := a.bo32(a.readU32At(off + 48))
+				sectBase := off + 56 // sizeof(segment_command)
+				for j := uint32(0); j < nsects; j++ {
+					sOff := sectBase + int(j)*68 // sizeof(section)
+					if sOff+68 > len(data) {
+						break
+					}
+					// section: addr@32 size@36 offset@40
+					sectOffset := a.bo32(a.readU32At(sOff + 40))
+					noteSection(sectOffset)
+					if segName == "__TEXT" && nullString(data[sOff:sOff+16]) == "__info_plist" {
+						plistSize := a.bo32(a.readU32At(sOff + 36))
+						a.setInfoPlist(sectOffset, uint64(plistSize))
+					}
+				}
 				switch segName {
 				case "__TEXT":
-					execSegLimit = uint64(a.bo32(a.readU32At(off + 28))) // vmsize
-					nsects := a.bo32(a.readU32At(off + 48))
-					sectBase := off + 56 // sizeof(segment_command)
-					for j := uint32(0); j < nsects; j++ {
-						sOff := sectBase + int(j)*68 // sizeof(section)
-						if sOff+68 > len(data) {
-							break
-						}
-						sectName := nullString(data[sOff : sOff+16])
-						switch sectName {
-						case "__text":
-							sectOffset := a.bo32(a.readU32At(sOff + 40))
-							sizeofCmds := a.bo32(a.readU32At(20))
-							if sectOffset > sizeofCmds+a.headerSize {
-								a.freeSpaceInCmds = sectOffset - sizeofCmds - a.headerSize
-							}
-						case "__info_plist":
-							plistOff := a.bo32(a.readU32At(sOff + 40))
-							plistSize := a.bo32(a.readU32At(sOff + 44))
-							if int(plistOff)+int(plistSize) <= len(data) {
-								a.infoPlist = string(data[plistOff : plistOff+plistSize])
-							}
-						}
-					}
+					a.execSegLimit = uint64(a.bo32(a.readU32At(off + 28))) // vmsize
 				case "__LINKEDIT":
 					a.linkeditOffset = off
 				}
@@ -118,32 +122,23 @@ func (a *ArchO) Init(data []byte) error {
 		case LCSegment64:
 			if off+72 <= len(data) {
 				segName := nullString(data[off+8 : off+24])
+				nsects := a.bo32(a.readU32At(off + 64))
+				sectBase := off + 72 // sizeof(segment_command_64)
+				for j := uint32(0); j < nsects; j++ {
+					sOff := sectBase + int(j)*80 // sizeof(section_64)
+					if sOff+80 > len(data) {
+						break
+					}
+					// section_64: addr@32 size@40 offset@48
+					sectOffset := a.bo32(a.readU32At(sOff + 48))
+					noteSection(sectOffset)
+					if segName == "__TEXT" && nullString(data[sOff:sOff+16]) == "__info_plist" {
+						a.setInfoPlist(sectOffset, a.bo64(a.readU64At(sOff+40)))
+					}
+				}
 				switch segName {
 				case "__TEXT":
-					execSegLimit = a.bo64(a.readU64At(off + 32)) // vmsize
-					nsects := a.bo32(a.readU32At(off + 64))
-					sectBase := off + 72 // sizeof(segment_command_64)
-					for j := uint32(0); j < nsects; j++ {
-						sOff := sectBase + int(j)*80 // sizeof(section_64)
-						if sOff+80 > len(data) {
-							break
-						}
-						sectName := nullString(data[sOff : sOff+16])
-						switch sectName {
-						case "__text":
-							sectOffset := a.bo32(a.readU32At(sOff + 48))
-							sizeofCmds := a.bo32(a.readU32At(20))
-							if sectOffset > sizeofCmds+a.headerSize {
-								a.freeSpaceInCmds = sectOffset - sizeofCmds - a.headerSize
-							}
-						case "__info_plist":
-							plistOff := a.bo32(a.readU32At(sOff + 48))
-							plistSize := uint32(a.bo64(a.readU64At(sOff + 40)))
-							if int(plistOff)+int(plistSize) <= len(data) {
-								a.infoPlist = string(data[plistOff : plistOff+plistSize])
-							}
-						}
-					}
+					a.execSegLimit = a.bo64(a.readU64At(off + 32)) // vmsize
 				case "__LINKEDIT":
 					a.linkeditOffset = off
 				}
@@ -169,7 +164,16 @@ func (a *ArchO) Init(data []byte) error {
 		off += int(cmdSize)
 	}
 
+	if firstSectOff > cmdsEnd {
+		a.freeSpaceInCmds = firstSectOff - cmdsEnd
+	}
 	return nil
+}
+
+func (a *ArchO) setInfoPlist(off uint32, size uint64) {
+	if uint64(off)+size <= uint64(len(a.data)) {
+		a.infoPlist = string(a.data[off : uint64(off)+size])
+	}
 }
 
 func (a *ArchO) IsExecute() bool {
@@ -331,7 +335,7 @@ func (a *ArchO) buildCodeSignature(asset *cert.Asset, force bool, bundleID, info
 
 	params := codesign.CDParams{
 		CodeBase:         a.data[:a.codeLength],
-		ExecSegLimit:     execSegLimit,
+		ExecSegLimit:     a.execSegLimit,
 		ExecSegFlags:     execSegFlags,
 		BundleID:         bundleID,
 		TeamID:           asset.TeamID,
@@ -399,46 +403,7 @@ func (a *ArchO) GetSigningCert() *x509.Certificate {
 	if end > len(a.data) {
 		return nil
 	}
-	sig := a.data[a.signOffset:end]
-
-	if len(sig) < 12 {
-		return nil
-	}
-	magic := binary.BigEndian.Uint32(sig[0:4])
-	if magic != CSMagicEmbeddedSignature {
-		return nil
-	}
-	count := int(binary.BigEndian.Uint32(sig[8:12]))
-	for i := 0; i < count; i++ {
-		base := 12 + i*8
-		if base+8 > len(sig) {
-			break
-		}
-		slotType := binary.BigEndian.Uint32(sig[base:])
-		slotOff := int(binary.BigEndian.Uint32(sig[base+4:]))
-		if slotType != CSSlotSignatureSlot {
-			continue
-		}
-		if slotOff+8 > len(sig) {
-			break
-		}
-		blobLen := int(binary.BigEndian.Uint32(sig[slotOff+4:]))
-		if slotOff+blobLen > len(sig) || blobLen <= 8 {
-			break
-		}
-		cmsData := sig[slotOff+8 : slotOff+blobLen]
-		p7, err := pkcs7.Parse(cmsData)
-		if err != nil || len(p7.Certificates) == 0 {
-			break
-		}
-		for _, c := range p7.Certificates {
-			if !c.IsCA {
-				return c
-			}
-		}
-		return p7.Certificates[0]
-	}
-	return nil
+	return codesign.SigningCert(a.data[a.signOffset:end])
 }
 
 func (a *ArchO) readU32(off int) uint32 {

@@ -2,7 +2,9 @@ package logger
 
 import (
 	"fmt"
+	"io"
 	"os"
+	"sync"
 )
 
 type Level int
@@ -15,7 +17,10 @@ const (
 	LevelDebug Level = 4
 )
 
-var current = LevelInfo
+var (
+	current = LevelInfo
+	mu      sync.Mutex
+)
 
 func SetLevel(l Level) { current = l }
 
@@ -23,13 +28,13 @@ func IsDebug() bool { return current >= LevelDebug }
 
 func Printf(format string, args ...interface{}) {
 	if current >= LevelInfo {
-		fmt.Fprintf(os.Stdout, format, args...)
+		write(os.Stdout, fmt.Sprintf(format, args...))
 	}
 }
 
 func Debugf(format string, args ...interface{}) {
 	if current >= LevelDebug {
-		fmt.Fprintf(os.Stdout, format, args...)
+		write(os.Stdout, fmt.Sprintf(format, args...))
 	}
 }
 
@@ -47,22 +52,26 @@ func Warnf(format string, args ...interface{}) {
 
 func Error(msg string) {
 	if current >= LevelError {
-		printColour(msg, "\033[31m")
+		printColourTo(os.Stderr, msg, "\033[31m")
 	}
 }
 
 func Errorf(format string, args ...interface{}) {
 	if current >= LevelError {
-		printColour(fmt.Sprintf(format, args...), "\033[31m")
+		printColourTo(os.Stderr, fmt.Sprintf(format, args...), "\033[31m")
 	}
 }
 
 func Success(msg string) {
-	printColour(msg, "\033[32m")
+	if current >= LevelInfo {
+		printColour(msg, "\033[32m")
+	}
 }
 
 func Successf(format string, args ...interface{}) {
-	printColour(fmt.Sprintf(format, args...), "\033[32m")
+	if current >= LevelInfo {
+		printColour(fmt.Sprintf(format, args...), "\033[32m")
+	}
 }
 
 func PrintResult(ok bool, format string, args ...interface{}) {
@@ -75,7 +84,26 @@ func PrintResult(ok bool, format string, args ...interface{}) {
 }
 
 func printColour(msg, code string) {
-	fmt.Fprint(os.Stdout, code)
-	fmt.Fprint(os.Stdout, msg)
-	fmt.Fprint(os.Stdout, "\033[0m")
+	printColourTo(os.Stdout, msg, code)
+}
+
+func printColourTo(f *os.File, msg, code string) {
+	if isTerminal(f) {
+		msg = code + msg + "\033[0m"
+	}
+	write(f, msg)
+}
+
+func write(w io.Writer, s string) {
+	mu.Lock()
+	defer mu.Unlock()
+	_, _ = io.WriteString(w, s)
+}
+
+func isTerminal(f *os.File) bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }

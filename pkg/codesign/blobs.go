@@ -2,9 +2,11 @@ package codesign
 
 import (
 	"bytes"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 
+	"go.mozilla.org/pkcs7"
 	"howett.net/plist"
 )
 
@@ -173,4 +175,40 @@ func BuildSuperBlob(cdSlot1, reqSlot, entSlot, derSlot, cdSlot256, cmsSlot []byt
 	}
 
 	return out.Bytes()
+}
+
+func SigningCert(sig []byte) *x509.Certificate {
+	if len(sig) < 12 || binary.BigEndian.Uint32(sig[0:4]) != 0xfade0cc0 { // CSMAGIC_EMBEDDED_SIGNATURE
+		return nil
+	}
+	count := int(binary.BigEndian.Uint32(sig[8:12]))
+	for i := 0; i < count; i++ {
+		base := 12 + i*8
+		if base+8 > len(sig) {
+			break
+		}
+		slotType := binary.BigEndian.Uint32(sig[base:])
+		slotOff := int(binary.BigEndian.Uint32(sig[base+4:]))
+		if slotType != 0x10000 { // CSSLOT_SIGNATURESLOT
+			continue
+		}
+		if slotOff+8 > len(sig) {
+			break
+		}
+		blobLen := int(binary.BigEndian.Uint32(sig[slotOff+4:]))
+		if slotOff+blobLen > len(sig) || blobLen <= 8 {
+			break
+		}
+		p7, err := pkcs7.Parse(sig[slotOff+8 : slotOff+blobLen])
+		if err != nil || len(p7.Certificates) == 0 {
+			break
+		}
+		for _, c := range p7.Certificates {
+			if !c.IsCA {
+				return c
+			}
+		}
+		return p7.Certificates[0]
+	}
+	return nil
 }

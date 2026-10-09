@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 
@@ -27,6 +28,7 @@ type Asset struct {
 	AppID       string
 
 	Cert    *x509.Certificate
+	CACerts []*x509.Certificate
 	PrivKey crypto.PrivateKey
 }
 
@@ -90,11 +92,12 @@ func (a *Asset) Init(certFile, pkeyFile, provFile, entitleFile, password string,
 		return fmt.Errorf("read private key file: %w", err)
 	}
 
-	privKey, embeddedCert, err := loadKeyAndCert(pkeyData, password)
+	privKey, embeddedCert, caCerts, err := loadKeyAndCert(pkeyData, password)
 	if err != nil {
 		return fmt.Errorf("load private key: %w", err)
 	}
 	a.PrivKey = privKey
+	a.CACerts = caCerts
 
 	if embeddedCert != nil && certMatchesKey(embeddedCert, privKey) {
 		a.Cert = embeddedCert
@@ -149,42 +152,41 @@ func extractP7Content(data []byte) ([]byte, error) {
 	return p7.Content, nil
 }
 
-func loadKeyAndCert(data []byte, password string) (crypto.PrivateKey, *x509.Certificate, error) {
+func loadKeyAndCert(data []byte, password string) (crypto.PrivateKey, *x509.Certificate, []*x509.Certificate, error) {
 	if block, _ := pem.Decode(data); block != nil {
 		switch block.Type {
 		case "RSA PRIVATE KEY":
 			k, err := x509.ParsePKCS1PrivateKey(block.Bytes)
 			if err != nil {
-				return nil, nil, fmt.Errorf("parse RSA key: %w", err)
+				return nil, nil, nil, fmt.Errorf("parse RSA key: %w", err)
 			}
-			return k, nil, nil
+			return k, nil, nil, nil
 		case "PRIVATE KEY":
 			k, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 			if err != nil {
-				return nil, nil, fmt.Errorf("parse PKCS8 key: %w", err)
+				return nil, nil, nil, fmt.Errorf("parse PKCS8 key: %w", err)
 			}
-			return k, nil, nil
+			return k, nil, nil, nil
+		case "ENCRYPTED PRIVATE KEY":
+			return nil, nil, nil, fmt.Errorf("encrypted PEM keys are not supported; use a .p12 or an unencrypted key")
 		}
 	}
 
 	if k, err := x509.ParsePKCS8PrivateKey(data); err == nil {
-		return k, nil, nil
+		return k, nil, nil, nil
 	}
 	if k, err := x509.ParsePKCS1PrivateKey(data); err == nil {
-		return k, nil, nil
+		return k, nil, nil, nil
 	}
 
-	privKey, cert, err := pkcs12.Decode(data, password)
+	privKey, cert, caCerts, err := pkcs12.DecodeChain(data, password)
 	if err == nil {
-		return privKey, cert, nil
+		return privKey, cert, caCerts, nil
 	}
-
-	privKey2, cert2, _, err2 := pkcs12.DecodeChain(data, password)
-	if err2 == nil {
-		return privKey2, cert2, nil
+	if errors.Is(err, pkcs12.ErrIncorrectPassword) {
+		return nil, nil, nil, fmt.Errorf("incorrect password for PKCS#12 file")
 	}
-
-	return nil, nil, fmt.Errorf("unrecognised key format (tried PEM RSA/PKCS8, DER, PKCS12)")
+	return nil, nil, nil, fmt.Errorf("unrecognised key format (tried PEM RSA/PKCS8, DER, PKCS#12: %v)", err)
 }
 
 func parseCert(data []byte) *x509.Certificate {

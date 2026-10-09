@@ -26,7 +26,7 @@ func IsZipFile(path string) bool {
 	return buf[0] == 'P' && buf[1] == 'K'
 }
 
-func Archive(folder, zipFile string, level int) error {
+func Archive(folder, zipFile string, level int) (err error) {
 	if level < 0 || level > 9 {
 		return fmt.Errorf("invalid compression level %d (must be 0–9)", level)
 	}
@@ -35,10 +35,21 @@ func Archive(folder, zipFile string, level int) error {
 	if err != nil {
 		return fmt.Errorf("create zip %s: %w", zipFile, err)
 	}
-	defer out.Close()
+	defer func() {
+		if cerr := out.Close(); err == nil && cerr != nil {
+			err = fmt.Errorf("close zip %s: %w", zipFile, cerr)
+		}
+		if err != nil {
+			_ = os.Remove(zipFile)
+		}
+	}()
 
 	zw := zip.NewWriter(out)
-	defer zw.Close()
+	defer func() {
+		if cerr := zw.Close(); err == nil && cerr != nil {
+			err = fmt.Errorf("finalize zip %s: %w", zipFile, cerr)
+		}
+	}()
 
 	if level > 0 {
 		zw.RegisterCompressor(zip.Deflate, func(w io.Writer) (io.WriteCloser, error) {
@@ -90,6 +101,15 @@ func Archive(folder, zipFile string, level int) error {
 			return fmt.Errorf("create zip entry %s: %w", relPath, err)
 		}
 
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return fmt.Errorf("readlink %s: %w", path, err)
+			}
+			_, err = io.WriteString(w, filepath.ToSlash(target))
+			return err
+		}
+
 		f, err := os.Open(path)
 		if err != nil {
 			return fmt.Errorf("open %s: %w", path, err)
@@ -114,17 +134,18 @@ func Extract(zipFile, outputFolder string) error {
 	}
 	defer r.Close()
 
-	type fileJob struct {
-		f    *zip.File
-		dest string
-	}
 	var files []fileJob
 
+	var links []fileJob
 	for _, f := range r.File {
 		if !isPathSafe(f.Name) {
 			continue
 		}
 		dest := filepath.Join(outputFolder, filepath.FromSlash(f.Name))
+		if f.Mode()&os.ModeSymlink != 0 {
+			links = append(links, fileJob{f, dest})
+			continue
+		}
 		if f.FileInfo().IsDir() || strings.HasSuffix(f.Name, "/") {
 			if err := os.MkdirAll(dest, 0755); err != nil {
 				return fmt.Errorf("mkdir %s: %w", dest, err)
@@ -137,6 +158,25 @@ func Extract(zipFile, outputFolder string) error {
 		files = append(files, fileJob{f, dest})
 	}
 
+	if err := extractFiles(files); err != nil {
+		_ = os.RemoveAll(outputFolder)
+		return err
+	}
+	for _, l := range links {
+		if err := extractSymlink(l.f, l.dest, outputFolder); err != nil {
+			_ = os.RemoveAll(outputFolder)
+			return err
+		}
+	}
+	return nil
+}
+
+type fileJob struct {
+	f    *zip.File
+	dest string
+}
+
+func extractFiles(files []fileJob) error {
 	if len(files) == 0 {
 		return nil
 	}
@@ -190,11 +230,31 @@ outer:
 		}
 	}
 
-	if firstErr != nil {
-		_ = os.RemoveAll(outputFolder)
-		return firstErr
+	return firstErr
+}
+
+func extractSymlink(f *zip.File, dest, root string) error {
+	rc, err := f.Open()
+	if err != nil {
+		return fmt.Errorf("open zip entry %s: %w", f.Name, err)
 	}
-	return nil
+	target, err := io.ReadAll(io.LimitReader(rc, 4096))
+	rc.Close()
+	if err != nil {
+		return fmt.Errorf("read link %s: %w", f.Name, err)
+	}
+	t := filepath.FromSlash(string(target))
+	resolved := filepath.Join(filepath.Dir(dest), t)
+	if filepath.IsAbs(t) || !isWithin(root, resolved) {
+		return fmt.Errorf("unsafe symlink %s -> %s", f.Name, target)
+	}
+	_ = os.Remove(dest)
+	return os.Symlink(t, dest)
+}
+
+func isWithin(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && filepath.IsLocal(rel)
 }
 
 func extractFile(f *zip.File, dest string, buf []byte) error {
@@ -204,7 +264,7 @@ func extractFile(f *zip.File, dest string, buf []byte) error {
 	}
 	defer rc.Close()
 
-	out, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+	out, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode().Perm()|0o600)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", dest, err)
 	}
@@ -217,15 +277,10 @@ func extractFile(f *zip.File, dest string, buf []byte) error {
 }
 
 func isPathSafe(name string) bool {
-	if name == "" || name[0] == '/' {
+	if strings.ContainsRune(name, '\\') {
 		return false
 	}
-	for _, part := range strings.Split(name, "/") {
-		if part == ".." {
-			return false
-		}
-	}
-	return true
+	return filepath.IsLocal(filepath.FromSlash(strings.TrimSuffix(name, "/")))
 }
 
 func FormatSize(path string) string {

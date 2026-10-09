@@ -15,8 +15,14 @@ func (a *ArchO) ReallocCodeSignSpace(newFile string) (uint32, error) {
 	extra := codesign.AlignUp(pages*(20+32), 4096) + 32768
 	newLength := a.codeLength + extra
 
-	if a.linkeditOffset < 0 || newLength <= uint32(len(a.data)) {
-		return 0, nil
+	if a.linkeditOffset < 0 {
+		return 0, fmt.Errorf("no __LINKEDIT segment")
+	}
+	if newLength <= uint32(len(a.data)) {
+		if err := os.WriteFile(newFile, a.data, 0755); err != nil {
+			return 0, err
+		}
+		return uint32(len(a.data)), nil
 	}
 
 	localData := make([]byte, len(a.data))

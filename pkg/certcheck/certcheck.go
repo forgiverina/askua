@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -24,6 +25,7 @@ import (
 	"software.sslmate.com/src/go-pkcs12"
 
 	"github.com/forgiverina/askua/pkg/cert"
+	"github.com/forgiverina/askua/pkg/codesign"
 	"github.com/forgiverina/askua/pkg/logger"
 )
 
@@ -69,7 +71,9 @@ func CheckFile(path, password string) error {
 		case kindProvision:
 			c = certFromProvision(data)
 		case kindP12:
-			c = certFromP12(data, password)
+			if c, err = certFromP12(data, password); err != nil {
+				return err
+			}
 		case kindCER, kindPEM:
 			c = parseCert(data)
 		case kindMachO:
@@ -191,16 +195,12 @@ func certFromProvision(data []byte) *x509.Certificate {
 	return nil
 }
 
-func certFromP12(data []byte, password string) *x509.Certificate {
-	_, c, err := pkcs12.Decode(data, password)
-	if err == nil {
-		return c
+func certFromP12(data []byte, password string) (*x509.Certificate, error) {
+	_, c, _, err := pkcs12.DecodeChain(data, password)
+	if errors.Is(err, pkcs12.ErrIncorrectPassword) {
+		return nil, fmt.Errorf("incorrect password for PKCS#12 file (use -p)")
 	}
-	_, c2, _, err2 := pkcs12.DecodeChain(data, password)
-	if err2 == nil {
-		return c2
-	}
-	return nil
+	return c, err
 }
 
 func parseCert(data []byte) *x509.Certificate {
@@ -311,7 +311,7 @@ func certFromSingleArch(data []byte) (signed bool, c *x509.Certificate) {
 			if end > len(data) {
 				break
 			}
-			c = certFromSuperBlob(data[sigOff:end])
+			c = codesign.SigningCert(data[sigOff:end])
 			return signed, c
 		}
 		off += cmdSize
@@ -320,47 +320,6 @@ func certFromSingleArch(data []byte) (signed bool, c *x509.Certificate) {
 		}
 	}
 	return false, nil
-}
-
-func certFromSuperBlob(sig []byte) *x509.Certificate {
-	if len(sig) < 12 {
-		return nil
-	}
-	magic := binary.BigEndian.Uint32(sig[0:4])
-	if magic != 0xfade0cc0 { // CSMAGIC_EMBEDDED_SIGNATURE
-		return nil
-	}
-	count := int(binary.BigEndian.Uint32(sig[8:12]))
-	for i := 0; i < count; i++ {
-		base := 12 + i*8
-		if base+8 > len(sig) {
-			break
-		}
-		slotType := binary.BigEndian.Uint32(sig[base:])
-		slotOff := int(binary.BigEndian.Uint32(sig[base+4:]))
-		if slotType != 0x10000 { // CSSLOT_SIGNATURESLOT
-			continue
-		}
-		if slotOff+8 > len(sig) {
-			break
-		}
-		blobLen := int(binary.BigEndian.Uint32(sig[slotOff+4:]))
-		if slotOff+blobLen > len(sig) || blobLen <= 8 {
-			break
-		}
-		cmsData := sig[slotOff+8 : slotOff+blobLen]
-		p7, err := pkcs7.Parse(cmsData)
-		if err != nil || len(p7.Certificates) == 0 {
-			break
-		}
-		for _, c := range p7.Certificates {
-			if !c.IsCA {
-				return c
-			}
-		}
-		return p7.Certificates[0]
-	}
-	return nil
 }
 
 func certFromIPA(ipaPath string) (signed bool, c *x509.Certificate) {
@@ -455,7 +414,8 @@ func performOCSP(leaf, issuer *x509.Certificate) (status, revokedAt, detail stri
 		return "Error", "", fmt.Sprintf("build request: %v", err)
 	}
 
-	resp, err := http.Post(ocspURL, "application/ocsp-request", bytes.NewReader(req)) //nolint:noctx
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Post(ocspURL, "application/ocsp-request", bytes.NewReader(req)) //nolint:noctx
 	if err != nil {
 		return "Error", "", fmt.Sprintf("HTTP POST: %v", err)
 	}

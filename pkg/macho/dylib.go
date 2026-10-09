@@ -3,6 +3,7 @@ package macho
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 
 	"github.com/forgiverina/askua/pkg/logger"
 )
@@ -36,8 +37,9 @@ func (a *ArchO) InjectDylib(weak bool, dylibPath string) error {
 	padding := 8 - nameLen%8
 	cmdSize := 24 + nameLen + padding // sizeof(dylib_command) + name + pad
 
-	if a.freeSpaceInCmds > 0 && uint32(cmdSize) > a.freeSpaceInCmds {
-		return fmt.Errorf("not enough free space for dylib load command")
+	if uint32(cmdSize) > a.freeSpaceInCmds {
+		return fmt.Errorf("not enough free space for dylib load command (need %d, have %d)",
+			cmdSize, a.freeSpaceInCmds)
 	}
 
 	sizeofCmds := a.bo32(a.readU32At(20))
@@ -63,6 +65,7 @@ func (a *ArchO) InjectDylib(weak bool, dylibPath string) error {
 	sizeofCmds += uint32(cmdSize)
 	a.putU32At(a.data, 16, a.bo32(ncmds))
 	a.putU32At(a.data, 20, a.bo32(sizeofCmds))
+	a.freeSpaceInCmds -= uint32(cmdSize)
 	return nil
 }
 
@@ -103,4 +106,17 @@ func (a *ArchO) RemoveDylibs(dylibs map[string]struct{}) {
 
 	a.putU32At(a.data, 16, a.bo32(ncmds-removedCount))
 	a.putU32At(a.data, 20, a.bo32(sizeofCmds-removedSize))
+	a.freeSpaceInCmds += removedSize
+}
+
+func DylibSet(names []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if strings.Contains(name, "/") {
+			set[name] = struct{}{}
+		} else {
+			set["@executable_path/"+name] = struct{}{}
+		}
+	}
+	return set
 }

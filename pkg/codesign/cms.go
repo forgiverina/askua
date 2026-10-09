@@ -60,13 +60,9 @@ func buildCMS(asset *cert.Asset, cdSlot1, cdSlot256 []byte) ([]byte, error) {
 		return nil, fmt.Errorf("cert or key not loaded")
 	}
 
-	intermedPEM := cert.AppleDevCACertG3
-	intermedCert, err := parsePEMCert(intermedPEM)
+	intermedCert, err := issuerFor(signingCert, asset.CACerts)
 	if err != nil {
-		intermedCert, err = parsePEMCert(cert.AppleDevCACert)
-		if err != nil {
-			return nil, fmt.Errorf("load Apple intermediate CA: %w", err)
-		}
+		return nil, err
 	}
 	rootCert, _ := parsePEMCert(cert.AppleRootCACert)
 
@@ -317,6 +313,25 @@ func concat(parts ...[]byte) []byte {
 		out = append(out, p...)
 	}
 	return out
+}
+
+func issuerFor(leaf *x509.Certificate, extra []*x509.Certificate) (*x509.Certificate, error) {
+	candidates := append([]*x509.Certificate(nil), extra...)
+	for _, p := range []string{cert.AppleDevCACertG3, cert.AppleDevCACert} {
+		if c, err := parsePEMCert(p); err == nil {
+			candidates = append(candidates, c)
+		}
+	}
+	for _, c := range candidates {
+		if bytes.Equal(leaf.RawIssuer, c.RawSubject) && leaf.CheckSignatureFrom(c) == nil {
+			return c, nil
+		}
+	}
+	g3, err := parsePEMCert(cert.AppleDevCACertG3)
+	if err != nil {
+		return nil, fmt.Errorf("load Apple intermediate CA: %w", err)
+	}
+	return g3, nil
 }
 
 func parsePEMCert(pemData string) (*x509.Certificate, error) {

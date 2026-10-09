@@ -1,6 +1,9 @@
 package codesign
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+)
 
 func derLength(n uint64) []byte {
 	if n < 128 {
@@ -34,10 +37,10 @@ func encodeDER(v interface{}) ([]byte, error) {
 		return encodeDERInt(x), nil
 
 	case int:
-		return encodeDERInt(uint64(x)), nil
+		return encodeDERSignedInt(int64(x)), nil
 
 	case int64:
-		return encodeDERInt(uint64(x)), nil
+		return encodeDERSignedInt(x), nil
 
 	case float32, float64:
 		return nil, fmt.Errorf("float not supported in DER entitlements")
@@ -60,8 +63,15 @@ func encodeDER(v interface{}) ([]byte, error) {
 		return append(res, inner...), nil
 
 	case map[string]interface{}:
+		keys := make([]string, 0, len(x))
+		for key := range x {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+
 		var inner []byte
-		for key, val := range x {
+		for _, key := range keys {
+			val := x[key]
 			valEnc, err := encodeDER(val)
 			if err != nil {
 				return nil, err
@@ -85,6 +95,18 @@ func encodeDER(v interface{}) ([]byte, error) {
 	}
 }
 
+func encodeDERSignedInt(v int64) []byte {
+	if v >= 0 {
+		return encodeDERInt(uint64(v))
+	}
+	b := []byte{byte(v)}
+	for v >>= 8; v != -1 || b[0]&0x80 == 0; v >>= 8 {
+		b = append([]byte{byte(v)}, b...)
+	}
+	res := append([]byte{0x02}, derLength(uint64(len(b)))...)
+	return append(res, b...)
+}
+
 func encodeDERInt(v uint64) []byte {
 	if v == 0 {
 		return []byte{0x02, 0x01, 0x00}
@@ -100,7 +122,6 @@ func encodeDERInt(v uint64) []byte {
 		b[i] = byte(v)
 		v >>= 8
 	}
-	// Prepend 0x00 if high bit to keep it positive
 	if b[0]&0x80 != 0 {
 		b = append([]byte{0x00}, b...)
 	}
